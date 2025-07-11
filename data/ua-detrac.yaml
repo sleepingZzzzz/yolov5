@@ -1,0 +1,5 @@
+path: D:/project/DLCV/DeepLearning_Design/datasets/UA_DETRAC
+train: images/train
+val: images/val
+nc: 1 # Only detect vehicles
+names: ['vehicle']
