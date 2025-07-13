@@ -1,31 +1,7 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """
 Run YOLOv5 detection inference on images, videos, directories, globs, YouTube, webcam, streams, etc.
-
-Usage - sources:
-    $ python detect.py --weights yolov5s.pt --source 0                               # webcam
-                                                     img.jpg                         # image
-                                                     vid.mp4                         # video
-                                                     screen                          # screenshot
-                                                     path/                           # directory
-                                                     list.txt                        # list of images
-                                                     list.streams                    # list of streams
-                                                     'path/*.jpg'                    # glob
-                                                     'https://youtu.be/LNwODJXcvt4'  # YouTube
-                                                     'rtsp://example.com/media.mp4'  # RTSP, RTMP, HTTP stream
-
-Usage - formats:
-    $ python detect.py --weights yolov5s.pt                 # PyTorch
-                                 yolov5s.torchscript        # TorchScript
-                                 yolov5s.onnx               # ONNX Runtime or OpenCV DNN with --dnn
-                                 yolov5s_openvino_model     # OpenVINO
-                                 yolov5s.engine             # TensorRT
-                                 yolov5s.mlpackage          # CoreML (macOS-only)
-                                 yolov5s_saved_model        # TensorFlow SavedModel
-                                 yolov5s.pb                 # TensorFlow GraphDef
-                                 yolov5s.tflite             # TensorFlow Lite
-                                 yolov5s_edgetpu.tflite     # TensorFlow Edge TPU
-                                 yolov5s_paddle_model       # PaddlePaddle
+...
 """
 
 import argparse
@@ -75,11 +51,14 @@ from deep_sort_realtime.deepsort_tracker import DeepSort
 
 # ---------------------- 新增全局变量 ----------------------
 last_positions = {}  # 保存每个track上次帧的中心位置及时间：{track_id: (center_x, center_y, timestamp)}
-speed_threshold = 5.0  # 速度阈值（像素/秒）：大于此值认为车辆行驶正常（绿灯），否则缓慢或停止（红灯）
+speed_threshold = 5.0  # 速度阈值（像素/秒），大于此值认为车辆行驶正常（绿灯），否则缓慢或停止（怠速）
 # 用于保存所有帧的track信息，最后写入JSON文件
 all_tracks = []
-# ---------------------- 新增：用于记录每个车辆累计油耗的字典 ----------------------
-fuel_consumption = {}  # key: track_id, value: 累计油耗（单位：升）
+# ---------------------- 新增记录每个车辆累计怠速油耗的字典 ----------------------
+fuel_consumption = {}  # key: track_id, value: 累计怠速油耗（单位：升）
+total_fuel_consumption = 0.0  # 全局累计怠速油耗（单位：升）
+# 固定红灯等待时间（静态情况下的怠速等待时间），单位秒
+fixed_red_duration = 10.0
 # ---------------------------------------------------------
 
 @smart_inference_mode()
@@ -114,6 +93,7 @@ def run(
         dnn=False,  # 使用OpenCV DNN进行ONNX推理
         vid_stride=1,  # 视频帧率步长
 ):
+    global total_fuel_consumption, fixed_red_duration  # 确保能使用全局定义的fixed_red_duration
     source = str(source)
     save_img = not nosave and not source.endswith(".txt")
     is_file = Path(source).suffix[1:] in (IMG_FORMATS + VID_FORMATS)
@@ -136,10 +116,10 @@ def run(
     tracker = DeepSort(max_age=30)
 
     # ----------------- 燃油消耗估计相关定义 -----------------
-    total_fuel_consumption = 0.0  # 累计燃油消耗（单位：升）
+    # 本次任务要求油耗只计入怠速状态下的油耗
     frame_duration = 1.0  # 假定每帧1秒（可根据实际fps调整）
-    def calc_fuel_consumption(idle_time_sec):
-        return idle_time_sec / 60.0 * 0.2  # 每分钟消耗0.2升燃油
+    def calc_fuel_consumption(time_sec):
+        return time_sec / 60.0 * 0.2  # 假定怠速下每分钟消耗0.2升燃油
     # -----------------------------------------------------------
 
     # Dataloader
@@ -259,7 +239,7 @@ def run(
                         save_one_box(xyxy, imc, file=save_dir / "crops" / names[c] / f"{p.stem}.jpg", BGR=True)
 
             # ---------------------------------------------------------------------
-            # 多目标跟踪、燃油消耗估计以及车辆速度与信号状态计算
+            # 多目标跟踪、怠速燃油消耗估计以及车辆速度与信号状态计算
             frame_fuel = 0.0
             if 'tracks' in locals():
                 for track in tracks:
@@ -267,7 +247,7 @@ def run(
                         continue
                     bbox = track.to_ltrb()  # [x1, y1, x2, y2]
                     track_id = track.track_id
-                    # 画红色跟踪框
+                    # 绘制红色跟踪框
                     cv2.rectangle(im0,
                                   (int(bbox[0] - (bbox[2] - bbox[0]) // 2), int(bbox[1] - (bbox[3] - bbox[1]) // 2)),
                                   (int(bbox[2] - (bbox[2] - bbox[0]) // 2), int(bbox[3] - (bbox[3] - bbox[1]) // 2)),
@@ -286,24 +266,34 @@ def run(
                     else:
                         speed = 0
                     track.speed = speed
+                    # 根据速度判断：速度低于阈值认为车辆怠速，信号置为 "RED"
                     track.signal = "GREEN" if speed >= speed_threshold else "RED"
                     cv2.putText(im0, f"Speed: {speed:.1f}px/s", (int(bbox[0]), int(bbox[3]) + 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
-                    # 计算燃油消耗
-                    fuel = calc_fuel_consumption(frame_duration)
+                    # 仅在怠速状态下计算油耗
+                    if track.signal == "RED":
+                        fuel = calc_fuel_consumption(frame_duration)
+                    else:
+                        fuel = 0.0
                     frame_fuel += fuel
-                    # 更新每个车辆的累计油耗
                     fuel_consumption[track_id] = fuel_consumption.get(track_id, 0) + fuel
-                    # 计算该车辆的油耗百分比（相对于当前全局累计油耗）
-                    fuel_percent = (fuel_consumption[track_id] / total_fuel_consumption * 100) if total_fuel_consumption > 0 else 0
-                    cv2.putText(im0, f"Fuel: {fuel:.3f}L ({fuel_percent:.1f}%)", (int(bbox[0]), int(bbox[3]) + 50),
+                    cv2.putText(im0, f"Fuel: {fuel:.3f}L", (int(bbox[0]), int(bbox[3]) + 50),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                     last_positions[track.track_id] = (center_x, center_y, current_time)
                 total_fuel_consumption += frame_fuel
                 cv2.putText(im0, f"Frame Fuel: {frame_fuel:.3f}L, Total: {total_fuel_consumption:.3f}L", (20, 80),
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+                # ------------------ 根据当前怠速车辆数计算油耗减少百分比 ------------------
+                idle_tracks = [track for track in tracks if track.is_confirmed() and track.signal=="RED"]
+                idle_count = len(idle_tracks)
+                static_idle_fuel = idle_count * calc_fuel_consumption(fixed_red_duration)
+                dynamic_idle_duration = max(fixed_red_duration - idle_count, 0)
+                dynamic_idle_fuel = idle_count * calc_fuel_consumption(dynamic_idle_duration)
+                reduction_percent = ((static_idle_fuel - dynamic_idle_fuel) / static_idle_fuel * 100) if static_idle_fuel > 0 else 0
+                cv2.putText(im0, f"Fuel Reduction: {reduction_percent:.1f}%", (20, 120),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
                 speeds = [track.speed for track in tracks if track.is_confirmed()]
-                avg_speed = sum(speeds) / len(speeds) if speeds else 0
+                avg_speed = sum(speeds)/len(speeds) if speeds else 0
                 overall_signal = "GREEN" if avg_speed >= speed_threshold else "RED"
                 update_current_tracks(tracks)
                 update_traffic_signal(overall_signal)
